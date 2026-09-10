@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Agent IA qui lit le README d'un repo et fait générer une revue d'architecture
-et des risques par un modèle IA local, en lui faisant jouer le rôle d'un
-ingénieur DevOps senior.
+et des risques par un modèle IA open source, en lui faisant jouer le rôle
+d'un ingénieur DevOps senior.
 
-Fonctionne avec n'importe quel serveur de modèle local exposant une API
-compatible OpenAI (Ollama, LM Studio, llama.cpp server, text-generation-webui,
-vLLM, ...).
+Utilise l'API OpenRouter (compatible OpenAI) par défaut — ce qui correspond
+à un setup opencode — mais fonctionne avec n'importe quelle API compatible
+OpenAI en changeant --base-url (Ollama, LM Studio, vLLM, ...).
 
 Usage:
-    python devops_review_agent.py /chemin/vers/le/repo --model llama3
-    python devops_review_agent.py . --model mistral --base-url http://localhost:1234/v1
+    export OPENROUTER_API_KEY="ta-clé"
+    python devops_review_agent.py /chemin/vers/le/repo --model meta-llama/llama-3.3-70b-instruct:free
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ EXCLUDED_DIRS = {
     ".venv", "venv", ".terraform", ".vagrant", "dist", "build",
 }
 
-DEFAULT_BASE_URL = "http://localhost:11434/v1"  # Ollama par défaut
+DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 
 SYSTEM_PROMPT = """Tu es un ingénieur DevOps senior avec 15 ans d'expérience \
 en infrastructure, conteneurisation, orchestration (Kubernetes), \
@@ -117,6 +117,12 @@ def run_review(repo_path: Path, model: str, base_url: str, api_key: str, max_tok
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": build_user_prompt(readme_content, tree)},
             ],
+            extra_headers={
+                # Recommandé par OpenRouter pour l'attribution dans leur classement,
+                # ignoré sans effet par les autres serveurs compatibles OpenAI.
+                "HTTP-Referer": "https://github.com/Milhhhhane/devops",
+                "X-Title": "devops-review-agent",
+            },
         )
     except AuthenticationError:
         print("Erreur : authentification refusée par le serveur local (clé API attendue ?).", file=sys.stderr)
@@ -144,19 +150,20 @@ def main() -> None:
     parser.add_argument("repo_path", nargs="?", default=".", help="Chemin vers le dépôt à analyser (défaut: .)")
     parser.add_argument(
         "--model",
-        default=os.environ.get("LOCAL_AI_MODEL", "llama3"),
-        help="Nom du modèle tel que connu par ton serveur local (défaut: llama3, ou $LOCAL_AI_MODEL)",
+        default=os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"),
+        help="Slug du modèle OpenRouter à utiliser (défaut: meta-llama/llama-3.3-70b-instruct:free, "
+             "ou $OPENROUTER_MODEL). Liste des modèles: https://openrouter.ai/models",
     )
     parser.add_argument(
         "--base-url",
-        default=os.environ.get("LOCAL_AI_BASE_URL", DEFAULT_BASE_URL),
-        help=f"URL de l'API compatible OpenAI de ton serveur local (défaut: {DEFAULT_BASE_URL}, ou $LOCAL_AI_BASE_URL). "
-             "Ollama: http://localhost:11434/v1 — LM Studio: http://localhost:1234/v1",
+        default=os.environ.get("OPENROUTER_BASE_URL", DEFAULT_BASE_URL),
+        help=f"URL de l'API compatible OpenAI à utiliser (défaut: {DEFAULT_BASE_URL}, ou $OPENROUTER_BASE_URL). "
+             "Change-la si tu utilises un serveur local (Ollama, LM Studio, ...).",
     )
     parser.add_argument(
         "--api-key",
-        default=os.environ.get("LOCAL_AI_API_KEY", "not-needed"),
-        help="Clé API si ton serveur local en exige une (défaut: 'not-needed', ou $LOCAL_AI_API_KEY)",
+        default=os.environ.get("OPENROUTER_API_KEY"),
+        help="Clé API (défaut: $OPENROUTER_API_KEY). Récupère la tienne sur https://openrouter.ai/keys",
     )
     parser.add_argument("--max-tokens", type=int, default=4096, help="Nombre max de tokens en sortie")
     parser.add_argument("--tree-depth", type=int, default=2, help="Profondeur de l'arborescence donnée en contexte")
@@ -166,6 +173,11 @@ def main() -> None:
     repo_path = Path(args.repo_path).resolve()
     if not repo_path.is_dir():
         print(f"Erreur : {repo_path} n'est pas un dossier valide.", file=sys.stderr)
+        sys.exit(1)
+
+    if not args.api_key:
+        print("Erreur : aucune clé API fournie. Définis OPENROUTER_API_KEY "
+              "(récupère-la sur https://openrouter.ai/keys) ou passe --api-key.", file=sys.stderr)
         sys.exit(1)
 
     try:
