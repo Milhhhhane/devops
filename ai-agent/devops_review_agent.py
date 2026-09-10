@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Agent IA qui lit le README d'un repo et fait générer une revue d'architecture
-et des risques par un modèle Claude, en lui faisant jouer le rôle d'un
+et des risques par un modèle IA local, en lui faisant jouer le rôle d'un
 ingénieur DevOps senior.
 
+Fonctionne avec n'importe quel serveur de modèle local exposant une API
+compatible OpenAI (Ollama, LM Studio, llama.cpp server, text-generation-webui,
+vLLM, ...).
+
 Usage:
-    python devops_review_agent.py /chemin/vers/le/repo
-    python devops_review_agent.py .  --model claude-opus-5 --output rapport.md
+    python devops_review_agent.py /chemin/vers/le/repo --model llama3
+    python devops_review_agent.py . --model mistral --base-url http://localhost:1234/v1
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ import os
 import sys
 from pathlib import Path
 
-import anthropic
+from openai import OpenAI, APIConnectionError, APIStatusError, AuthenticationError, NotFoundError, RateLimitError
 
 README_CANDIDATES = [
     "README.md", "readme.md", "Readme.md",
@@ -26,6 +30,8 @@ EXCLUDED_DIRS = {
     ".git", ".hg", ".svn", "node_modules", "__pycache__",
     ".venv", "venv", ".terraform", ".vagrant", "dist", "build",
 }
+
+DEFAULT_BASE_URL = "http://localhost:11434/v1"  # Ollama par défaut
 
 SYSTEM_PROMPT = """Tu es un ingénieur DevOps senior avec 15 ans d'expérience \
 en infrastructure, conteneurisation, orchestration (Kubernetes), \
@@ -96,56 +102,63 @@ Contenu du README :
 Fais ta revue d'architecture et ta liste de risques en suivant le format demandé."""
 
 
-def run_review(repo_path: Path, model: str, max_tokens: int, effort: str, tree_depth: int) -> str:
+def run_review(repo_path: Path, model: str, base_url: str, api_key: str, max_tokens: int, tree_depth: int) -> str:
     readme_path = find_readme(repo_path)
     readme_content = readme_path.read_text(encoding="utf-8", errors="replace")
     tree = build_repo_tree(repo_path, max_depth=tree_depth)
 
-    client = anthropic.Anthropic()
+    client = OpenAI(base_url=base_url, api_key=api_key)
 
     try:
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=model,
             max_tokens=max_tokens,
-            system=SYSTEM_PROMPT,
-            output_config={"effort": effort},
-            messages=[{"role": "user", "content": build_user_prompt(readme_content, tree)}],
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": build_user_prompt(readme_content, tree)},
+            ],
         )
-    except anthropic.AuthenticationError:
-        print("Erreur : clé API invalide ou absente. Définis ANTHROPIC_API_KEY.", file=sys.stderr)
+    except AuthenticationError:
+        print("Erreur : authentification refusée par le serveur local (clé API attendue ?).", file=sys.stderr)
         sys.exit(1)
-    except TypeError as e:
-        if "authentication" in str(e).lower():
-            print("Erreur : aucune méthode d'authentification trouvée. Définis ANTHROPIC_API_KEY "
-                  "(ou connecte-toi avec `ant auth login`).", file=sys.stderr)
-            sys.exit(1)
-        raise
-    except anthropic.PermissionDeniedError:
-        print("Erreur : la clé API n'a pas les permissions nécessaires.", file=sys.stderr)
+    except NotFoundError:
+        print(f"Erreur : modèle introuvable sur le serveur ({model}). "
+              f"Vérifie qu'il est bien chargé/installé.", file=sys.stderr)
         sys.exit(1)
-    except anthropic.NotFoundError:
-        print(f"Erreur : modèle introuvable ({model}).", file=sys.stderr)
+    except RateLimitError:
+        print("Erreur : le serveur local est surchargé, réessaie dans quelques instants.", file=sys.stderr)
         sys.exit(1)
-    except anthropic.RateLimitError as e:
-        retry_after = e.response.headers.get("retry-after", "quelques secondes")
-        print(f"Erreur : limite de débit atteinte, réessaie dans {retry_after}.", file=sys.stderr)
+    except APIConnectionError:
+        print(f"Erreur : impossible de joindre le serveur IA local à {base_url}. "
+              f"Vérifie qu'il est bien démarré.", file=sys.stderr)
         sys.exit(1)
-    except anthropic.APIConnectionError:
-        print("Erreur : impossible de joindre l'API Anthropic (réseau).", file=sys.stderr)
-        sys.exit(1)
-    except anthropic.APIStatusError as e:
+    except APIStatusError as e:
         print(f"Erreur API ({e.status_code}) : {e.message}", file=sys.stderr)
         sys.exit(1)
 
-    return "\n".join(block.text for block in response.content if block.type == "text")
+    return response.choices[0].message.content or ""
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("repo_path", nargs="?", default=".", help="Chemin vers le dépôt à analyser (défaut: .)")
-    parser.add_argument("--model", default="claude-opus-5", help="Modèle Claude à utiliser (défaut: claude-opus-5)")
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("LOCAL_AI_MODEL", "llama3"),
+        help="Nom du modèle tel que connu par ton serveur local (défaut: llama3, ou $LOCAL_AI_MODEL)",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=os.environ.get("LOCAL_AI_BASE_URL", DEFAULT_BASE_URL),
+        help=f"URL de l'API compatible OpenAI de ton serveur local (défaut: {DEFAULT_BASE_URL}, ou $LOCAL_AI_BASE_URL). "
+             "Ollama: http://localhost:11434/v1 — LM Studio: http://localhost:1234/v1",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("LOCAL_AI_API_KEY", "not-needed"),
+        help="Clé API si ton serveur local en exige une (défaut: 'not-needed', ou $LOCAL_AI_API_KEY)",
+    )
     parser.add_argument("--max-tokens", type=int, default=4096, help="Nombre max de tokens en sortie")
-    parser.add_argument("--effort", default="high", choices=["low", "medium", "high", "xhigh", "max"], help="Niveau d'effort du modèle")
     parser.add_argument("--tree-depth", type=int, default=2, help="Profondeur de l'arborescence donnée en contexte")
     parser.add_argument("--output", type=Path, default=None, help="Fichier où sauvegarder le rapport (en plus de l'affichage)")
     args = parser.parse_args()
@@ -156,7 +169,7 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        report = run_review(repo_path, args.model, args.max_tokens, args.effort, args.tree_depth)
+        report = run_review(repo_path, args.model, args.base_url, args.api_key, args.max_tokens, args.tree_depth)
     except FileNotFoundError as e:
         print(f"Erreur : {e}", file=sys.stderr)
         sys.exit(1)
